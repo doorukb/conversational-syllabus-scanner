@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import base64
 import os
 from pathlib import Path
@@ -111,7 +112,8 @@ async def extract(
 
     try:
         client = _get_client()
-        result = extract_syllabus(blocks, client=client, debug=False)
+        # extract_syllabus is a blocking SDK call, so keep it off the event loop
+        result = await asyncio.to_thread(extract_syllabus, blocks, client=client, debug=False)
         validation, policy = await run_analysis(result, client=client, debug=False)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
@@ -165,16 +167,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
     client = _get_client()
 
     try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        answer, updated_history = await loop.run_in_executor(
-            None,
-            lambda: answer_question(
-                request.extraction,
-                request.history,
-                request.message,
-                client=client,
-            ),
+        answer, updated_history = await asyncio.to_thread(
+            answer_question,
+            request.extraction,
+            request.history,
+            request.message,
+            client=client,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

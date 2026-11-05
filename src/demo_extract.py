@@ -260,17 +260,14 @@ async def validate_extraction(
         "Add a warning for each issue found.\n"
         f"Report your findings via the {VALIDATION_TOOL_NAME} tool."
     )
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            system=_build_validation_system_prompt(),
-            tools=[_build_validation_tool()],
-            tool_choice={"type": "tool", "name": VALIDATION_TOOL_NAME},
-            messages=[{"role": "user", "content": user_content}],
-        ),
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=MODEL_ID,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        system=_build_validation_system_prompt(),
+        tools=[_build_validation_tool()],
+        tool_choice={"type": "tool", "name": VALIDATION_TOOL_NAME},
+        messages=[{"role": "user", "content": user_content}],
     )
     _debug_stderr(debug, f"validation stop_reason={response.stop_reason}")
 
@@ -288,9 +285,8 @@ async def validate_extraction(
     )
 
 # the third chained call to score each policy bullet for harshness.
-# Anthropic SDK is synchronous, and client.messages.create() is a blocking call.
-# we will use loop.run_in_executor to run the call asynchronously because asyncio is not enough
-# None argument means to use the default thread pool executor.
+# The Anthropic SDK client is synchronous, so client.messages.create() blocks.
+# asyncio.to_thread runs it in a worker thread so asyncio.gather can overlap the two calls.
 async def flag_policies(
     extraction: SyllabusExtraction,
     *,
@@ -320,17 +316,14 @@ async def flag_policies(
         "Set overall_severity to the highest severity level found across all policies."
     )
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            system=system,
-            tools=[_build_policy_tool()],
-            tool_choice={"type": "tool", "name": "report_policy_flags"},
-            messages=[{"role": "user", "content": user_content}],
-        ),
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=MODEL_ID,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        system=system,
+        tools=[_build_policy_tool()],
+        tool_choice={"type": "tool", "name": "report_policy_flags"},
+        messages=[{"role": "user", "content": user_content}],
     )
     _debug_stderr(debug, f"policy stop_reason={response.stop_reason}")
 
