@@ -107,6 +107,12 @@ class ValidationResult(BaseModel):
     grading_sums_to_100: bool = Field(..., description="True if grading weights sum to 100%")
     grading_total: float = Field(..., description="Actual sum of grading weights")
 
+# What the model returns for the date check. The grading total is added up in Python instead.
+class DateCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    warnings: list[ValidationWarning] = Field(default_factory=list)
+
 class PolicyFlag(BaseModel):
     model_config = ConfigDict(extra="forbid")
     policy: str = Field(..., description="The original policy text being evaluated")
@@ -165,10 +171,10 @@ def _build_validation_tool() -> dict[str, Any]:
     return {
         "name": VALIDATION_TOOL_NAME,
         "description": (
-            "Report logical consistency issues found in extracted syllabus data. "
+            "Report date conflicts found in extracted syllabus data. "
             "Always call this tool even if no warnings are found."
         ),
-        "input_schema": ValidationResult.model_json_schema(),
+        "input_schema": DateCheckResult.model_json_schema(),
     }
 
 @functools.lru_cache(maxsize=1)
@@ -261,12 +267,33 @@ def extract_syllabus(doc_blocks: list[ContentBlock], *, client: Anthropic, debug
 
 def _build_validation_system_prompt() -> str:
     return (
-        "You are a syllabus data validator. "
-        "You will receive extracted syllabus data as JSON and must check it for logical issues. "
+        "You are a syllabus date checker. "
+        "You will receive extracted syllabus data as JSON and must look for date conflicts. "
         f"Always call the {VALIDATION_TOOL_NAME} tool, even when no issues were found."
     )
 
-# Second chained call: checks extracted data for logical inconsistencies.
+# Allow a little rounding slack, e.g. three weights of 33.3 add up to 99.9
+GRADING_TOLERANCE: Final[float] = 0.5
+
+# Add up the grading weights in code instead of asking the model to do arithmetic.
+def check_grading(extraction: SyllabusExtraction) -> tuple[float, bool, list[ValidationWarning]]:
+    total = round(sum(w.percent for w in extraction.grading_weights), 2)
+    if not extraction.grading_weights:
+        warning = ValidationWarning(
+            field="grading_weights", message="No grading weights were extracted.", severity="low"
+        )
+        return total, False, [warning]
+    if abs(total - 100.0) > GRADING_TOLERANCE:
+        warning = ValidationWarning(
+            field="grading_weights",
+            message=f"Grading weights add up to {total}%, not 100%.",
+            severity="medium",
+        )
+        return total, False, [warning]
+    return total, True, []
+
+# Second chained call: the model looks for date conflicts in the extracted data.
+# The grading total is computed in Python (check_grading), so only dates go to the model.
 async def validate_extraction(
     extraction: SyllabusExtraction,
     *,
@@ -275,14 +302,11 @@ async def validate_extraction(
 ) -> ValidationResult:
     payload = json.dumps(extraction.model_dump(mode="json"), indent=2, ensure_ascii=False)
     user_content = (
-        "Check this extracted syllabus data for logical inconsistencies:\n\n"
+        "Check the important_dates in this extracted syllabus data for conflicts:\n\n"
         f"{payload}\n\n"
-        "Specifically:\n"
-        "1. Do the grading_weights percentages sum to 100? Set grading_total to their sum "
-        "and grading_sums_to_100 accordingly. Add a warning if they do not sum to 100.\n"
-        "2. Are any important_dates logically inconsistent with each other "
+        "Are any dates logically inconsistent with each other "
         "(e.g. final before midterm, withdrawal deadline after final exam)? "
-        "Add a warning for each issue found.\n"
+        "Add a warning for each issue found. Ignore grading_weights, they are checked elsewhere.\n"
         f"Report your findings via the {VALIDATION_TOOL_NAME} tool."
     )
     response = await asyncio.to_thread(
@@ -299,11 +323,17 @@ async def validate_extraction(
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == VALIDATION_TOOL_NAME:
             try:
-                return ValidationResult.model_validate(block.input)
+                date_check = DateCheckResult.model_validate(block.input)
             except ValidationError as exc:
                 raise RuntimeError(
                     "Validation tool input did not pass Pydantic validation."
                 ) from exc
+            total, sums_to_100, grading_warnings = check_grading(extraction)
+            return ValidationResult(
+                warnings=grading_warnings + date_check.warnings,
+                grading_sums_to_100=sums_to_100,
+                grading_total=total,
+            )
     raise RuntimeError(
         f"Validation call did not return a {VALIDATION_TOOL_NAME!r} tool_use block. "
         f"Content types: {[getattr(b, 'type', '?') for b in response.content]}"
