@@ -1,13 +1,17 @@
 from __future__ import annotations
+import asyncio
 import base64
+import logging
 import os
 from pathlib import Path
+import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from api.models import ExtractionResponse, HealthResponse, InfoResponse
 from src.demo_extract import (
+    MAX_BINARY_BYTES,
     ContentBlock,
     build_calendar,
     extract_syllabus,
@@ -21,9 +25,15 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
+MAX_UPLOAD_BYTES = MAX_BINARY_BYTES
+
+log = logging.getLogger(__name__)
+
+class MissingAPIKey(RuntimeError):
+    pass
 
 app = FastAPI(
-    title="Syllabus Parser API",
+    title="Conversational Syllabus Scanner API",
     description="Extract structured data from course syllabi using Claude.",
     version="0.1.0",
 )
@@ -37,8 +47,21 @@ async def serve_ui() -> FileResponse:
 def _get_client() -> Anthropic:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+        raise MissingAPIKey("ANTHROPIC_API_KEY is not set.")
     return Anthropic(api_key=api_key)
+
+# Map errors to HTTP codes without sending raw SDK or internal error text to the client.
+def _to_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, MissingAPIKey):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, anthropic.APIError):
+        log.exception("Anthropic API error")
+        return HTTPException(status_code=502, detail="The Anthropic API returned an error.")
+    if isinstance(exc, RuntimeError):
+        # these messages are written in demo_extract.py, so they are safe to show
+        return HTTPException(status_code=502, detail=str(exc))
+    log.exception("Unexpected error")
+    return HTTPException(status_code=500, detail="Something went wrong. Check the server logs.")
 
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
@@ -47,7 +70,7 @@ async def root() -> RedirectResponse:
 @app.get("/api", response_model=InfoResponse)
 async def api_info() -> InfoResponse:
     return InfoResponse(
-        name="Syllabus Parser API",
+        name="Conversational Syllabus Scanner API",
         description="Extract structured data from course syllabi using Claude.",
         endpoints=[
             "GET  /app            — web UI",
@@ -80,7 +103,12 @@ async def extract(
     blocks: list[ContentBlock] = []
 
     if file is not None:
-        raw = await file.read()
+        raw = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+            )
         content_type = (file.content_type or "").lower()
         ext = os.path.splitext(file.filename or "")[1].lower()
 
@@ -111,12 +139,11 @@ async def extract(
 
     try:
         client = _get_client()
-        result = extract_syllabus(blocks, client=client, debug=False)
+        # extract_syllabus is a blocking SDK call, so keep it off the event loop
+        result = await asyncio.to_thread(extract_syllabus, blocks, client=client, debug=False)
         validation, policy = await run_analysis(result, client=client, debug=False)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise _to_http_error(e) from e
 
     return ExtractionResponse(
         extraction=result,
@@ -162,21 +189,16 @@ async def generate_calendar(request: CalendarRequest) -> Response:
 # then send the full conversation history with every request
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    client = _get_client()
-
     try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        answer, updated_history = await loop.run_in_executor(
-            None,
-            lambda: answer_question(
-                request.extraction,
-                request.history,
-                request.message,
-                client=client,
-            ),
+        client = _get_client()
+        answer, updated_history = await asyncio.to_thread(
+            answer_question,
+            request.extraction,
+            request.history,
+            request.message,
+            client=client,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _to_http_error(e) from e
 
     return ChatResponse(answer=answer, history=updated_history)

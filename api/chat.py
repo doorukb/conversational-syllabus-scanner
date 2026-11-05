@@ -43,7 +43,10 @@ def answer_question(
         messages=messages,
     )
 
-    answer = response.content[0].text
+    texts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+    if not texts:
+        raise RuntimeError("The model returned no text for this message.")
+    answer = "\n".join(texts)
 
     # Build updated history including this turn
     updated_history = list(history) + [

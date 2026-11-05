@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import sys
+import uuid
 from typing import Any, Final, TypeAlias
 import asyncio
 from anthropic import Anthropic
@@ -18,12 +19,13 @@ try:
 except ImportError:  # python-dotenv not installed; set ANTHROPIC_API_KEY directly
     load_dotenv = lambda: None  # noqa: E731
 
-# Pinned snapshot ID (weights fixed for this ID). See README for aliases / upgrades. Feel free to change it into a different model for your own use
+# Pinned model snapshot. Change it here to use a different model.
 MODEL_ID: Final[str] = "claude-haiku-4-5-20251001"
 
 DEFAULT_MAX_CHARS: Final[int] = 50_000
 MAX_OUTPUT_TOKENS: Final[int] = 4096
-MAX_BINARY_BYTES: Final[int] = 32 * 1024 * 1024
+# base64 adds about a third and the API request limit is 32 MB, so cap the raw file at 20 MB
+MAX_BINARY_BYTES: Final[int] = 20 * 1024 * 1024
 TOOL_NAME: Final[str] = "submit_syllabus_extraction"
 
 ContentBlock: TypeAlias = dict[str, Any]
@@ -106,6 +108,12 @@ class ValidationResult(BaseModel):
     grading_sums_to_100: bool = Field(..., description="True if grading weights sum to 100%")
     grading_total: float = Field(..., description="Actual sum of grading weights")
 
+# What the model returns for the date check. The grading total is added up in Python instead.
+class DateCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    warnings: list[ValidationWarning] = Field(default_factory=list)
+
 class PolicyFlag(BaseModel):
     model_config = ConfigDict(extra="forbid")
     policy: str = Field(..., description="The original policy text being evaluated")
@@ -164,10 +172,10 @@ def _build_validation_tool() -> dict[str, Any]:
     return {
         "name": VALIDATION_TOOL_NAME,
         "description": (
-            "Report logical consistency issues found in extracted syllabus data. "
+            "Report date conflicts found in extracted syllabus data. "
             "Always call this tool even if no warnings are found."
         ),
-        "input_schema": ValidationResult.model_json_schema(),
+        "input_schema": DateCheckResult.model_json_schema(),
     }
 
 @functools.lru_cache(maxsize=1)
@@ -223,25 +231,70 @@ def _parse_tool_use(message: Message) -> SyllabusExtraction:
         f"Model did not return a {TOOL_NAME!r} tool_use block."
     )
 
-# single API call; model returns structured data via tool_use
+# The model returns structured data via tool_use. If the result fails Pydantic validation
+# (for example an impossible date), retry once and tell the model what was wrong.
 def extract_syllabus(doc_blocks: list[ContentBlock], *, client: Anthropic, debug: bool) -> SyllabusExtraction:
     messages: list[dict[str, Any]] = [{"role": "user", "content": _build_user_content(doc_blocks)}]
     response = _call_model(client, messages=messages, debug=debug)
     try:
         return _parse_tool_use(response)
-    except ValidationError as exc:
-        raise RuntimeError(
-            "Tool input did not pass Pydantic validation."
-        ) from exc
+    except ValidationError as first_error:
+        _debug_stderr(debug, "extraction failed validation, retrying once")
+        tool_call = next(
+            b for b in response.content
+            if getattr(b, "type", None) == "tool_use" and b.name == TOOL_NAME
+        )
+        messages = messages + [
+            {"role": "assistant", "content": response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "is_error": True,
+                        "content": f"Validation failed: {first_error}. Call the tool again with corrected input.",
+                    }
+                ],
+            },
+        ]
+        response = _call_model(client, messages=messages, debug=debug)
+        try:
+            return _parse_tool_use(response)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "Tool input did not pass Pydantic validation, even after one retry."
+            ) from exc
 
 def _build_validation_system_prompt() -> str:
     return (
-        "You are a syllabus data validator. "
-        "You will receive extracted syllabus data as JSON and must check it for logical issues. "
+        "You are a syllabus date checker. "
+        "You will receive extracted syllabus data as JSON and must look for date conflicts. "
         f"Always call the {VALIDATION_TOOL_NAME} tool, even when no issues were found."
     )
 
-# Second chained call: checks extracted data for logical inconsistencies.
+# Allow a little rounding slack, e.g. three weights of 33.3 add up to 99.9
+GRADING_TOLERANCE: Final[float] = 0.5
+
+# Add up the grading weights in code instead of asking the model to do arithmetic.
+def check_grading(extraction: SyllabusExtraction) -> tuple[float, bool, list[ValidationWarning]]:
+    total = round(sum(w.percent for w in extraction.grading_weights), 2)
+    if not extraction.grading_weights:
+        warning = ValidationWarning(
+            field="grading_weights", message="No grading weights were extracted.", severity="low"
+        )
+        return total, False, [warning]
+    if abs(total - 100.0) > GRADING_TOLERANCE:
+        warning = ValidationWarning(
+            field="grading_weights",
+            message=f"Grading weights add up to {total}%, not 100%.",
+            severity="medium",
+        )
+        return total, False, [warning]
+    return total, True, []
+
+# Second chained call: the model looks for date conflicts in the extracted data.
+# The grading total is computed in Python (check_grading), so only dates go to the model.
 async def validate_extraction(
     extraction: SyllabusExtraction,
     *,
@@ -250,47 +303,46 @@ async def validate_extraction(
 ) -> ValidationResult:
     payload = json.dumps(extraction.model_dump(mode="json"), indent=2, ensure_ascii=False)
     user_content = (
-        "Check this extracted syllabus data for logical inconsistencies:\n\n"
+        "Check the important_dates in this extracted syllabus data for conflicts:\n\n"
         f"{payload}\n\n"
-        "Specifically:\n"
-        "1. Do the grading_weights percentages sum to 100? Set grading_total to their sum "
-        "and grading_sums_to_100 accordingly. Add a warning if they do not sum to 100.\n"
-        "2. Are any important_dates logically inconsistent with each other "
+        "Are any dates logically inconsistent with each other "
         "(e.g. final before midterm, withdrawal deadline after final exam)? "
-        "Add a warning for each issue found.\n"
+        "Add a warning for each issue found. Ignore grading_weights, they are checked elsewhere.\n"
         f"Report your findings via the {VALIDATION_TOOL_NAME} tool."
     )
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            system=_build_validation_system_prompt(),
-            tools=[_build_validation_tool()],
-            tool_choice={"type": "tool", "name": VALIDATION_TOOL_NAME},
-            messages=[{"role": "user", "content": user_content}],
-        ),
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=MODEL_ID,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        system=_build_validation_system_prompt(),
+        tools=[_build_validation_tool()],
+        tool_choice={"type": "tool", "name": VALIDATION_TOOL_NAME},
+        messages=[{"role": "user", "content": user_content}],
     )
     _debug_stderr(debug, f"validation stop_reason={response.stop_reason}")
 
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == VALIDATION_TOOL_NAME:
             try:
-                return ValidationResult.model_validate(block.input)
+                date_check = DateCheckResult.model_validate(block.input)
             except ValidationError as exc:
                 raise RuntimeError(
                     "Validation tool input did not pass Pydantic validation."
                 ) from exc
+            total, sums_to_100, grading_warnings = check_grading(extraction)
+            return ValidationResult(
+                warnings=grading_warnings + date_check.warnings,
+                grading_sums_to_100=sums_to_100,
+                grading_total=total,
+            )
     raise RuntimeError(
         f"Validation call did not return a {VALIDATION_TOOL_NAME!r} tool_use block. "
         f"Content types: {[getattr(b, 'type', '?') for b in response.content]}"
     )
 
 # the third chained call to score each policy bullet for harshness.
-# Anthropic SDK is synchronous, and client.messages.create() is a blocking call.
-# we will use loop.run_in_executor to run the call asynchronously because asyncio is not enough
-# None argument means to use the default thread pool executor.
+# The Anthropic SDK client is synchronous, so client.messages.create() blocks.
+# asyncio.to_thread runs it in a worker thread so asyncio.gather can overlap the two calls.
 async def flag_policies(
     extraction: SyllabusExtraction,
     *,
@@ -320,17 +372,14 @@ async def flag_policies(
         "Set overall_severity to the highest severity level found across all policies."
     )
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            system=system,
-            tools=[_build_policy_tool()],
-            tool_choice={"type": "tool", "name": "report_policy_flags"},
-            messages=[{"role": "user", "content": user_content}],
-        ),
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=MODEL_ID,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        system=system,
+        tools=[_build_policy_tool()],
+        tool_choice={"type": "tool", "name": "report_policy_flags"},
+        messages=[{"role": "user", "content": user_content}],
     )
     _debug_stderr(debug, f"policy stop_reason={response.stop_reason}")
 
@@ -365,7 +414,7 @@ def build_calendar(
     course_code: str | None,
 ) -> Calendar:
     cal = Calendar()
-    cal.add("prodid", "-//Syllabus Parser//EN")
+    cal.add("prodid", "-//Conversational Syllabus Scanner//EN")
     cal.add("version", "2.0")
     cal.add("calscale", "GREGORIAN")
     cal.add("x-wr-calname", course_code or "Syllabus")
@@ -376,6 +425,9 @@ def build_calendar(
 
         start = datetime.date.fromisoformat(item.date_iso)
         event = Event()
+        # UID and DTSTAMP are required for every VEVENT in RFC 5545
+        event.add("uid", f"{uuid.uuid4()}@conversational-syllabus-scanner")
+        event.add("dtstamp", datetime.datetime.now(datetime.timezone.utc))
         event.add("summary", item.label)
         event.add("dtstart", start)
         # All-day events use an exclusive end date (day after start), per RFC 5545.
