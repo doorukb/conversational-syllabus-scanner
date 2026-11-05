@@ -65,10 +65,58 @@ def test_extract_with_mocked_llm(client, monkeypatch):
     assert body["validation"]["grading_sums_to_100"] is True
 
 
-def test_extract_reports_missing_key_as_503(client, monkeypatch):
-    def boom():
-        raise RuntimeError("ANTHROPIC_API_KEY is not set")
+def _no_key():
+    raise main.MissingAPIKey("ANTHROPIC_API_KEY is not set")
 
-    monkeypatch.setattr(main, "_get_client", boom)
+
+def test_extract_reports_missing_key_as_503(client, monkeypatch):
+    monkeypatch.setattr(main, "_get_client", _no_key)
     r = client.post("/extract", data={"text": "anything"})
     assert r.status_code == 503
+
+
+def test_chat_reports_missing_key_as_503(client, monkeypatch):
+    monkeypatch.setattr(main, "_get_client", _no_key)
+    r = client.post("/chat", json={"extraction": {}, "history": [], "message": "hi"})
+    assert r.status_code == 503
+
+
+def test_unparseable_model_output_is_502(client, monkeypatch):
+    def fail(blocks, client, debug):
+        raise RuntimeError("Tool input did not pass Pydantic validation, even after one retry.")
+
+    monkeypatch.setattr(main, "_get_client", lambda: object())
+    monkeypatch.setattr(main, "extract_syllabus", fail)
+    r = client.post("/extract", data={"text": "anything"})
+    assert r.status_code == 502
+    assert "even after one retry" in r.json()["detail"]
+
+
+def test_unexpected_error_does_not_leak_details(client, monkeypatch):
+    def fail(blocks, client, debug):
+        raise ValueError("secret internal detail")
+
+    monkeypatch.setattr(main, "_get_client", lambda: object())
+    monkeypatch.setattr(main, "extract_syllabus", fail)
+    r = client.post("/extract", data={"text": "anything"})
+    assert r.status_code == 500
+    assert "secret" not in r.text
+
+
+def test_upload_over_the_cap_is_413(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 10)
+    r = client.post("/extract", files={"file": ("big.txt", b"x" * 11, "text/plain")})
+    assert r.status_code == 413
+
+
+def test_calendar_endpoint_needs_no_model(client):
+    body = {
+        "extraction": {
+            "course_code": "CS 101",
+            "important_dates": [{"label": "Final", "date_iso": "2025-12-10"}],
+        }
+    }
+    r = client.post("/calendar", json=body)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/calendar")
+    assert "DTSTART;VALUE=DATE:20251210" in r.text
