@@ -19,7 +19,7 @@ try:
 except ImportError:  # python-dotenv not installed; set ANTHROPIC_API_KEY directly
     load_dotenv = lambda: None  # noqa: E731
 
-# Pinned snapshot ID (weights fixed for this ID). See README for aliases / upgrades. Feel free to change it into a different model for your own use
+# Pinned model snapshot. Change it here to use a different model.
 MODEL_ID: Final[str] = "claude-haiku-4-5-20251001"
 
 DEFAULT_MAX_CHARS: Final[int] = 50_000
