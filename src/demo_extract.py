@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import sys
+import uuid
 from typing import Any, Final, TypeAlias
 import asyncio
 from anthropic import Anthropic
@@ -424,6 +425,9 @@ def build_calendar(
 
         start = datetime.date.fromisoformat(item.date_iso)
         event = Event()
+        # UID and DTSTAMP are required for every VEVENT in RFC 5545
+        event.add("uid", f"{uuid.uuid4()}@conversational-syllabus-scanner")
+        event.add("dtstamp", datetime.datetime.now(datetime.timezone.utc))
         event.add("summary", item.label)
         event.add("dtstart", start)
         # All-day events use an exclusive end date (day after start), per RFC 5545.
