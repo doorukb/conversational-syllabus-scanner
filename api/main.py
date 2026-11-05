@@ -23,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
-    title="Syllabus Parser API",
+    title="Conversational Syllabus Scanner API",
     description="Extract structured data from course syllabi using Claude.",
     version="0.1.0",
 )
@@ -47,7 +47,7 @@ async def root() -> RedirectResponse:
 @app.get("/api", response_model=InfoResponse)
 async def api_info() -> InfoResponse:
     return InfoResponse(
-        name="Syllabus Parser API",
+        name="Conversational Syllabus Scanner API",
         description="Extract structured data from course syllabi using Claude.",
         endpoints=[
             "GET  /app            — web UI",

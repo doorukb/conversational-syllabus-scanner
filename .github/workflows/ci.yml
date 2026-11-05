@@ -16,4 +16,4 @@ jobs:
       - name: API tests (mocked LLM)
         run: python -m pytest tests/ -q
       - name: Docker image builds
-        run: docker build -t smart-syllabus-scanner .
+        run: docker build -t conversational-syllabus-scanner .

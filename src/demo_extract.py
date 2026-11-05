@@ -365,7 +365,7 @@ def build_calendar(
     course_code: str | None,
 ) -> Calendar:
     cal = Calendar()
-    cal.add("prodid", "-//Syllabus Parser//EN")
+    cal.add("prodid", "-//Conversational Syllabus Scanner//EN")
     cal.add("version", "2.0")
     cal.add("calscale", "GREGORIAN")
     cal.add("x-wr-calname", course_code or "Syllabus")
