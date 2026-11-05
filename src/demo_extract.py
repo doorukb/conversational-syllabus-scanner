@@ -23,7 +23,8 @@ MODEL_ID: Final[str] = "claude-haiku-4-5-20251001"
 
 DEFAULT_MAX_CHARS: Final[int] = 50_000
 MAX_OUTPUT_TOKENS: Final[int] = 4096
-MAX_BINARY_BYTES: Final[int] = 32 * 1024 * 1024
+# base64 adds about a third and the API request limit is 32 MB, so cap the raw file at 20 MB
+MAX_BINARY_BYTES: Final[int] = 20 * 1024 * 1024
 TOOL_NAME: Final[str] = "submit_syllabus_extraction"
 
 ContentBlock: TypeAlias = dict[str, Any]
