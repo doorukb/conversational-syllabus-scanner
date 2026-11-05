@@ -224,16 +224,40 @@ def _parse_tool_use(message: Message) -> SyllabusExtraction:
         f"Model did not return a {TOOL_NAME!r} tool_use block."
     )
 
-# single API call; model returns structured data via tool_use
+# The model returns structured data via tool_use. If the result fails Pydantic validation
+# (for example an impossible date), retry once and tell the model what was wrong.
 def extract_syllabus(doc_blocks: list[ContentBlock], *, client: Anthropic, debug: bool) -> SyllabusExtraction:
     messages: list[dict[str, Any]] = [{"role": "user", "content": _build_user_content(doc_blocks)}]
     response = _call_model(client, messages=messages, debug=debug)
     try:
         return _parse_tool_use(response)
-    except ValidationError as exc:
-        raise RuntimeError(
-            "Tool input did not pass Pydantic validation."
-        ) from exc
+    except ValidationError as first_error:
+        _debug_stderr(debug, "extraction failed validation, retrying once")
+        tool_call = next(
+            b for b in response.content
+            if getattr(b, "type", None) == "tool_use" and b.name == TOOL_NAME
+        )
+        messages = messages + [
+            {"role": "assistant", "content": response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "is_error": True,
+                        "content": f"Validation failed: {first_error}. Call the tool again with corrected input.",
+                    }
+                ],
+            },
+        ]
+        response = _call_model(client, messages=messages, debug=debug)
+        try:
+            return _parse_tool_use(response)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "Tool input did not pass Pydantic validation, even after one retry."
+            ) from exc
 
 def _build_validation_system_prompt() -> str:
     return (
